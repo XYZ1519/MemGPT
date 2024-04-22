@@ -1,48 +1,52 @@
 import datetime
-import uuid
 import inspect
 import json
-from pathlib import Path
 import traceback
-from typing import List, Tuple, Optional, cast, Union
+import uuid
+from pathlib import Path
+from typing import List, Optional, Tuple, Union, cast
+
 from tqdm import tqdm
 
-from memgpt.metadata import MetadataStore
-from memgpt.agent_store.storage import StorageConnector, TableType
-from memgpt.data_types import AgentState, Message, LLMConfig, EmbeddingConfig, Passage, Preset
-from memgpt.models import chat_completion_response
-from memgpt.interface import AgentInterface
-from memgpt.persistence_manager import LocalStateManager
-from memgpt.system import get_login_event, package_function_response, package_summarize_message, get_initial_boot_messages
-from memgpt.memory import CoreMemory as InContextMemory, summarize_messages, ArchivalMemory, RecallMemory
-from memgpt.llm_api_tools import create, is_context_overflow_error
-from memgpt.utils import (
-    get_utc_time,
-    create_random_username,
-    get_tool_call_id,
-    get_local_time,
-    parse_json,
-    united_diff,
-    printd,
-    count_tokens,
-    get_schema_diff,
-    validate_function_response,
-    verify_first_message_correctness,
-    create_uuid_from_string,
-    is_utc_datetime,
-)
+from memgpt.agent_store.storage import StorageConnector
 from memgpt.constants import (
-    FIRST_MESSAGE_ATTEMPTS,
-    JSON_LOADS_STRICT,
-    MESSAGE_SUMMARY_WARNING_FRAC,
-    MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC,
-    MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST,
+    CLI_WARNING_PREFIX,
     CORE_MEMORY_HUMAN_CHAR_LIMIT,
     CORE_MEMORY_PERSONA_CHAR_LIMIT,
-    LLM_MAX_TOKENS,
-    CLI_WARNING_PREFIX,
+    FIRST_MESSAGE_ATTEMPTS,
     JSON_ENSURE_ASCII,
+    JSON_LOADS_STRICT,
+    LLM_MAX_TOKENS,
+    MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST,
+    MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC,
+    MESSAGE_SUMMARY_WARNING_FRAC,
 )
+from memgpt.data_types import AgentState, EmbeddingConfig, LLMConfig, Message, Passage, Preset
+from memgpt.interface import AgentInterface
+from memgpt.llm_api.llm_api_tools import create, is_context_overflow_error
+from memgpt.memory import ArchivalMemory
+from memgpt.memory import CoreMemory as InContextMemory
+from memgpt.memory import RecallMemory, summarize_messages
+from memgpt.metadata import MetadataStore
+from memgpt.models import chat_completion_response
+from memgpt.persistence_manager import LocalStateManager
+from memgpt.system import get_initial_boot_messages, get_login_event, package_function_response, package_summarize_message
+from memgpt.utils import (
+    count_tokens,
+    create_random_username,
+    create_uuid_from_string,
+    get_local_time,
+    get_schema_diff,
+    get_tool_call_id,
+    get_utc_time,
+    is_utc_datetime,
+    parse_json,
+    printd,
+    united_diff,
+    validate_function_response,
+    verify_first_message_correctness,
+)
+
 from .errors import LLMError
 from .functions.functions import USER_FUNCTIONS_DIR, load_all_function_sets
 
@@ -234,7 +238,7 @@ class Agent(object):
 
         # Store the system instructions (used to rebuild memory)
         if "system" not in self.agent_state.state:
-            raise ValueError(f"'system' not found in provided AgentState")
+            raise ValueError("'system' not found in provided AgentState")
         self.system = self.agent_state.state["system"]
 
         if "functions" not in self.agent_state.state:
@@ -400,9 +404,10 @@ class Agent(object):
 
     def _get_ai_reply(
         self,
-        message_sequence: List[dict],
+        message_sequence: List[Message],
         function_call: str = "auto",
         first_message: bool = False,  # hint
+        stream: bool = False,  # TODO move to config?
     ) -> chat_completion_response.ChatCompletionResponse:
         """Get response from LLM API"""
         try:
@@ -414,6 +419,9 @@ class Agent(object):
                 function_call=function_call,
                 # hint
                 first_message=first_message,
+                # streaming
+                stream=stream,
+                stream_inferface=self.interface,
             )
             # special case for 'length'
             if response.choices[0].finish_reason == "length":
@@ -628,6 +636,7 @@ class Agent(object):
         skip_verify: bool = False,
         return_dicts: bool = True,  # if True, return dicts, if False, return Message objects
         recreate_message_timestamp: bool = True,  # if True, when input is a Message type, recreated the 'created_at' field
+        stream: bool = False,  # TODO move to config?
     ) -> Tuple[List[Union[dict, Message]], bool, bool, bool]:
         """Top-level event message handler for the MemGPT agent"""
 
@@ -694,12 +703,12 @@ class Agent(object):
 
                 self.interface.user_message(user_message.text, msg_obj=user_message)
 
-                input_message_sequence = self.messages + [user_message.to_openai_dict()]
+                input_message_sequence = self._messages + [user_message]
             # Alternatively, the requestor can send an empty user message
             else:
-                input_message_sequence = self.messages
+                input_message_sequence = self._messages
 
-            if len(input_message_sequence) > 1 and input_message_sequence[-1]["role"] != "user":
+            if len(input_message_sequence) > 1 and input_message_sequence[-1].role != "user":
                 printd(f"{CLI_WARNING_PREFIX}Attempting to run ChatCompletion without user as the last message in the queue")
 
             # Step 1: send the conversation and available functions to GPT
@@ -710,6 +719,7 @@ class Agent(object):
                     response = self._get_ai_reply(
                         message_sequence=input_message_sequence,
                         first_message=True,  # passed through to the prompt formatter
+                        stream=stream,
                     )
                     if verify_first_message_correctness(response, require_monologue=self.first_message_verify_mono):
                         break
@@ -721,6 +731,7 @@ class Agent(object):
             else:
                 response = self._get_ai_reply(
                     message_sequence=input_message_sequence,
+                    stream=stream,
                 )
 
             # Step 2: check if LLM wanted to call a function
@@ -858,14 +869,14 @@ class Agent(object):
                 printd(f"Selected cutoff {cutoff} was a 'tool', shifting one...")
                 cutoff += 1
 
-        message_sequence_to_summarize = self.messages[1:cutoff]  # do NOT get rid of the system message
+        message_sequence_to_summarize = self._messages[1:cutoff]  # do NOT get rid of the system message
         if len(message_sequence_to_summarize) <= 1:
             # This prevents a potential infinite loop of summarizing the same message over and over
             raise LLMError(
                 f"Summarize error: tried to run summarize, but couldn't find enough messages to compress [len={len(message_sequence_to_summarize)} <= 1]"
             )
         else:
-            printd(f"Attempting to summarize {len(message_sequence_to_summarize)} messages [1:{cutoff}] of {len(self.messages)}")
+            printd(f"Attempting to summarize {len(message_sequence_to_summarize)} messages [1:{cutoff}] of {len(self._messages)}")
 
         # We can't do summarize logic properly if context_window is undefined
         if self.agent_state.llm_config.context_window is None:
@@ -1101,7 +1112,7 @@ def save_agent(agent: Agent, ms: MetadataStore):
     agent.update_state()
     agent_state = agent.agent_state
 
-    if ms.get_agent(agent_id=agent_state.id):
+    if ms.get_agent(agent_name=agent_state.name, user_id=agent_state.user_id):
         ms.update_agent(agent_state)
     else:
         ms.create_agent(agent_state)

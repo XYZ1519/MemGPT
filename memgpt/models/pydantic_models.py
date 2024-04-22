@@ -1,14 +1,15 @@
-from typing import List, Optional, Dict, Literal, Type
-from pydantic import BaseModel, Field, Json, ConfigDict
 import uuid
-import base64
-import numpy as np
 from datetime import datetime
-from sqlmodel import Field, SQLModel
-from sqlalchemy import JSON, Column, BINARY, TypeDecorator
+from enum import Enum
+from typing import Dict, List, Optional
 
-from memgpt.constants import DEFAULT_HUMAN, DEFAULT_MEMGPT_MODEL, DEFAULT_PERSONA, DEFAULT_PRESET, LLM_MAX_TOKENS, MAX_EMBEDDING_DIM
-from memgpt.utils import get_human_text, get_persona_text, printd, get_utc_time
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import JSON, Column
+from sqlalchemy_utils import ChoiceType
+from sqlmodel import Field, SQLModel
+
+from memgpt.constants import DEFAULT_HUMAN, DEFAULT_PERSONA
+from memgpt.utils import get_human_text, get_persona_text, get_utc_time
 
 
 class LLMConfigModel(BaseModel):
@@ -44,13 +45,33 @@ class PresetModel(BaseModel):
     functions_schema: List[Dict] = Field(..., description="The functions schema of the preset.")
 
 
-class ToolModel(BaseModel):
+class ToolModel(SQLModel, table=True):
     # TODO move into database
     name: str = Field(..., description="The name of the function.")
-    json_schema: dict = Field(..., description="The JSON schema of the function.")
-    tags: List[str] = Field(..., description="Metadata tags.")
-    source_type: Optional[Literal["python"]] = Field(None, description="The type of the source code.")
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, description="The unique identifier of the function.", primary_key=True)
+    tags: List[str] = Field(sa_column=Column(JSON), description="Metadata tags.")
+    source_type: Optional[str] = Field(None, description="The type of the source code.")
     source_code: Optional[str] = Field(..., description="The source code of the function.")
+
+    json_schema: Dict = Field(default_factory=dict, sa_column=Column(JSON), description="The JSON schema of the function.")
+
+    # Needed for Column(JSON)
+    class Config:
+        arbitrary_types_allowed = True
+
+
+class AgentToolMap(SQLModel, table=True):
+    # mapping between agents and tools
+    agent_id: uuid.UUID = Field(..., description="The unique identifier of the agent.")
+    tool_id: uuid.UUID = Field(..., description="The unique identifier of the tool.")
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, description="The unique identifier of the agent-tool map.", primary_key=True)
+
+
+class PresetToolMap(SQLModel, table=True):
+    # mapping between presets and tools
+    preset_id: uuid.UUID = Field(..., description="The unique identifier of the preset.")
+    tool_id: uuid.UUID = Field(..., description="The unique identifier of the tool.")
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, description="The unique identifier of the preset-tool map.", primary_key=True)
 
 
 class AgentStateModel(BaseModel):
@@ -110,6 +131,23 @@ class SourceModel(SQLModel, table=True):
     )
     # NOTE: .metadata is a reserved attribute on SQLModel
     metadata_: Optional[dict] = Field(None, sa_column=Column(JSON), description="Metadata associated with the source.")
+
+
+class JobStatus(str, Enum):
+    created = "created"
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+
+
+class JobModel(SQLModel, table=True):
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, description="The unique identifier of the job.", primary_key=True)
+    # status: str = Field(default="created", description="The status of the job.")
+    status: JobStatus = Field(default=JobStatus.created, description="The status of the job.", sa_column=Column(ChoiceType(JobStatus)))
+    created_at: datetime = Field(default_factory=get_utc_time, description="The unix timestamp of when the job was created.")
+    completed_at: Optional[datetime] = Field(None, description="The unix timestamp of when the job was completed.")
+    user_id: uuid.UUID = Field(..., description="The unique identifier of the user associated with the job.")
+    metadata_: Optional[dict] = Field({}, sa_column=Column(JSON), description="The metadata of the job.")
 
 
 class PassageModel(BaseModel):

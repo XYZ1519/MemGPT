@@ -1,42 +1,39 @@
-from datetime import datetime, timezone, timedelta
 import copy
-import re
+import difflib
+import hashlib
+import inspect
+import io
 import json
 import os
 import pickle
 import platform
 import random
+import re
 import subprocess
-import uuid
 import sys
-import io
-import hashlib
-from typing import List
-import inspect
-from functools import wraps
-from typing import get_type_hints, Union, _GenericAlias
-
-
-from urllib.parse import urlparse
+import uuid
 from contextlib import contextmanager
-import difflib
+from datetime import datetime, timedelta, timezone
+from functools import wraps
+from typing import List, Union, _GenericAlias, get_type_hints
+from urllib.parse import urljoin, urlparse
+
 import demjson3 as demjson
 import pytz
 import tiktoken
 
 import memgpt
 from memgpt.constants import (
-    JSON_LOADS_STRICT,
-    MEMGPT_DIR,
-    FUNCTION_RETURN_CHAR_LIMIT,
     CLI_WARNING_PREFIX,
     CORE_MEMORY_HUMAN_CHAR_LIMIT,
     CORE_MEMORY_PERSONA_CHAR_LIMIT,
+    FUNCTION_RETURN_CHAR_LIMIT,
     JSON_ENSURE_ASCII,
+    JSON_LOADS_STRICT,
+    MEMGPT_DIR,
     TOOL_CALL_ID_MAX_LEN,
 )
 from memgpt.models.chat_completion_response import ChatCompletionResponse
-
 from memgpt.openai_backcompat.openai_object import OpenAIObject
 
 # TODO: what is this?
@@ -467,6 +464,13 @@ NOUN_BANK = [
     "yak",
     "zebra",
 ]
+
+
+def smart_urljoin(base_url: str, relative_url: str) -> str:
+    """urljoin is stupid and wants a trailing / at the end of the endpoint address, or it will chop the suffix off"""
+    if not base_url.endswith("/"):
+        base_url += "/"
+    return urljoin(base_url, relative_url)
 
 
 def is_utc_datetime(dt: datetime) -> bool:

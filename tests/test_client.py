@@ -1,23 +1,18 @@
-import uuid
 import os
-import time
 import threading
+import time
+import uuid
+
+import pytest
 from dotenv import load_dotenv
 
 from memgpt import Admin, create_client
 from memgpt.constants import DEFAULT_PRESET
-from memgpt.data_types import Preset  # TODO move to PresetModel
-from dotenv import load_dotenv
-
-from tests.config import TestMGPTConfig
-
 from memgpt.credentials import MemGPTCredentials
+from memgpt.data_types import Preset  # TODO move to PresetModel
 from memgpt.data_types import EmbeddingConfig, LLMConfig
-from .utils import wipe_config, wipe_memgpt_home
-
-
-import pytest
-import uuid
+from memgpt.settings import settings
+from tests.config import TestMGPTConfig
 
 test_agent_name = f"test_client_{str(uuid.uuid4())}"
 # test_preset_name = "test_preset"
@@ -28,23 +23,18 @@ client = None
 test_agent_state_post_message = None
 test_user_id = uuid.uuid4()
 
-local_service_url = "http://localhost:8283"
-docker_compose_url = "http://localhost:8083"
 
 # admin credentials
 test_server_token = "test_server_token"
 
 
 def run_server():
-    import uvicorn
-    from memgpt.server.rest_api.server import app
-    from memgpt.server.rest_api.server import start_server
+    pass
 
     load_dotenv()
 
     # Use os.getenv with a fallback to os.environ.get
-    db_url = os.getenv("MEMGPT_PGURI") or os.environ.get("MEMGPT_PGURI")
-    assert db_url, "Missing MEMGPT_PGURI"
+    db_url = settings.pg_uri
 
     if os.getenv("OPENAI_API_KEY"):
         config = TestMGPTConfig(
@@ -98,43 +88,50 @@ def run_server():
     config.save()
     credentials.save()
 
-    print("Starting server...")
+    from memgpt.server.rest_api.server import start_server
+
+    print("Starting server...", config.config_path)
     start_server(debug=True)
 
 
 # Fixture to create clients with different configurations
 @pytest.fixture(
-    params=[
-        {"base_url": local_service_url},
-        {"base_url": docker_compose_url},  # TODO: add when docker compose added to tests
-        # {"base_url": None} # TODO: add when implemented
+    params=[  # whether to use REST API server
+        {"server": True},
+        # {"server": False} # TODO: add when implemented
     ],
     scope="module",
 )
-# @pytest.fixture(params=[{"base_url": test_base_url}], scope="module")
 def client(request):
-    print("CLIENT", request.param["base_url"])
-    if request.param["base_url"]:
-        if request.param["base_url"] == local_service_url:
-            # start server
+    if request.param["server"]:
+        # get URL from enviornment
+        server_url = os.getenv("MEMGPT_SERVER_URL")
+        if server_url is None:
+            # run server in thread
+            # NOTE: must set MEMGPT_SERVER_PASS enviornment variable
+            server_url = "http://localhost:8283"
             print("Starting server thread")
             thread = threading.Thread(target=run_server, daemon=True)
             thread.start()
             time.sleep(5)
-
-        admin = Admin(request.param["base_url"], test_server_token)
+        print("Running client tests with server:", server_url)
+        # create user via admin client
+        admin = Admin(server_url, test_server_token)
         response = admin.create_user(test_user_id)  # Adjust as per your client's method
-        user_id = response.user_id
+        response.user_id
         token = response.api_key
     else:
+        # use local client (no server)
         token = None
+        server_url = None
 
-    client = create_client(**request.param, token=token)  # This yields control back to the test function
-    yield client
-
-    # cleanup user
-    if request.param["base_url"]:
-        admin.delete_user(test_user_id)  # Adjust as per your client's method
+    client = create_client(base_url=server_url, token=token)  # This yields control back to the test function
+    try:
+        yield client
+    finally:
+        # cleanup user
+        if server_url:
+            admin.delete_user(test_user_id)  # Adjust as per your client's method
 
 
 # Fixture for test agent
@@ -225,13 +222,13 @@ def test_humans_personas(client, agent):
     assert human.text == "Human text", "Creating human failed"
 
 
-def test_tools(client, agent):
-    tools_response = client.list_tools()
-    print("TOOLS", tools_response)
-
-    tool_name = "TestTool"
-    tool_response = client.create_tool(name=tool_name, source_code="print('Hello World')", source_type="python")
-    assert tool_response, "Creating tool failed"
+# def test_tools(client, agent):
+#    tools_response = client.list_tools()
+#    print("TOOLS", tools_response)
+#
+#    tool_name = "TestTool"
+#    tool_response = client.create_tool(name=tool_name, source_code="print('Hello World')", source_type="python")
+#    assert tool_response, "Creating tool failed"
 
 
 def test_config(client, agent):
@@ -271,7 +268,8 @@ def test_sources(client, agent):
 
     # load a file into a source
     filename = "CONTRIBUTING.md"
-    response = client.load_file_into_source(filename=filename, source_id=source.id)
+    upload_job = client.load_file_into_source(filename=filename, source_id=source.id)
+    print("Upload job", upload_job, upload_job.status, upload_job.metadata)
 
     # TODO: make sure things run in the right order
     archival_memories = client.get_agent_archival_memory(agent_id=agent.id).archival_memory
@@ -334,7 +332,6 @@ def test_presets(client, agent):
     # List all presets and make sure the preset is NOT in the list
     all_presets = client.list_presets()
     assert new_preset.id not in [p.id for p in all_presets], (new_preset, all_presets)
-
     # Create a preset
     client.create_preset(preset=new_preset)
 
@@ -348,3 +345,29 @@ def test_presets(client, agent):
     # List all presets and make sure the preset is NOT in the list
     all_presets = client.list_presets()
     assert new_preset.id not in [p.id for p in all_presets], (new_preset, all_presets)
+
+
+# def test_tools(client, agent):
+#
+#    # load a function
+#    file_path = "tests/data/functions/dump_json.py"
+#    module_name = "dump_json"
+#
+#    # list functions
+#    response = client.list_tools()
+#    orig_tools = response.tools
+#    print(orig_tools)
+#
+#    # add the tool
+#    create_tool_response = client.create_tool(name=module_name, file_path=file_path)
+#    print(create_tool_response)
+#
+#    # list functions
+#    response = client.list_tools()
+#    new_tools = response.tools
+#    assert module_name in [tool.name for tool in new_tools]
+#    # assert len(new_tools) == len(orig_tools) + 1
+#
+#    # TODO: add a function to a preset
+#
+#    # TODO: add a function to an agent

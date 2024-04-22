@@ -1,5 +1,5 @@
 import os
-from logging import CRITICAL, ERROR, WARN, WARNING, INFO, DEBUG, NOTSET
+from logging import CRITICAL, DEBUG, ERROR, INFO, NOTSET, WARN, WARNING
 
 MEMGPT_DIR = os.path.join(os.path.expanduser("~"), ".memgpt")
 
@@ -86,6 +86,8 @@ MESSAGE_SUMMARY_WARNING_STR = " ".join(
 )
 # The fraction of tokens we truncate down to
 MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC = 0.75
+# The ackknowledgement message used in the summarize sequence
+MESSAGE_SUMMARY_REQUEST_ACK = "Understood, I will respond with a summary of the message (and only the summary, nothing else) once I receive the conversation history. I'm ready."
 
 # Even when summarizing, we want to keep a handful of recent messages
 # These serve as in-context examples of how to use functions / what user messages look like

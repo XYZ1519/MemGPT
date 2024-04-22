@@ -1,29 +1,31 @@
+import json
 import os
 import sys
 import traceback
-import json
 
 import questionary
+import requests
 import typer
-
 from rich.console import Console
-from memgpt.constants import FUNC_FAILED_HEARTBEAT_MESSAGE, JSON_ENSURE_ASCII, JSON_LOADS_STRICT, REQ_HEARTBEAT_MESSAGE
 
-console = Console()
-
-from memgpt.agent_store.storage import StorageConnector, TableType
-from memgpt.interface import CLIInterface as interface  # for printing to terminal
-from memgpt.config import MemGPTConfig
 import memgpt.agent as agent
-import memgpt.system as system
 import memgpt.errors as errors
-from memgpt.cli.cli import run, version, server, open_folder, quickstart, migrate, delete_agent
-from memgpt.cli.cli_config import configure, list, add, delete
-from memgpt.cli.cli_load import app as load_app
-from memgpt.metadata import MetadataStore
+import memgpt.system as system
+from memgpt.agent_store.storage import StorageConnector, TableType
 
 # import benchmark
 from memgpt.benchmark.benchmark import bench
+from memgpt.cli.cli import delete_agent, migrate, open_folder, quickstart, run, server, version
+from memgpt.cli.cli_config import add, configure, delete, list
+from memgpt.cli.cli_load import app as load_app
+from memgpt.config import MemGPTConfig
+from memgpt.constants import FUNC_FAILED_HEARTBEAT_MESSAGE, JSON_ENSURE_ASCII, JSON_LOADS_STRICT, REQ_HEARTBEAT_MESSAGE
+from memgpt.metadata import MetadataStore
+
+# from memgpt.interface import CLIInterface as interface  # for printing to terminal
+from memgpt.streaming_interface import AgentRefreshStreamingInterface
+
+# interface = interface()
 
 app = typer.Typer(pretty_exceptions_enable=False)
 app.command(name="run")(run)
@@ -45,7 +47,7 @@ app.command(name="benchmark")(bench)
 app.command(name="delete-agent")(delete_agent)
 
 
-def clear_line(strip_ui=False):
+def clear_line(console, strip_ui=False):
     if strip_ui:
         return
     if os.name == "nt":  # for windows
@@ -55,7 +57,19 @@ def clear_line(strip_ui=False):
         sys.stdout.flush()
 
 
-def run_agent_loop(memgpt_agent, config: MemGPTConfig, first, ms: MetadataStore, no_verify=False, cfg=None, strip_ui=False):
+def run_agent_loop(
+    memgpt_agent: agent.Agent, config: MemGPTConfig, first, ms: MetadataStore, no_verify=False, cfg=None, strip_ui=False, stream=False
+):
+    if isinstance(memgpt_agent.interface, AgentRefreshStreamingInterface):
+        # memgpt_agent.interface.toggle_streaming(on=stream)
+        if not stream:
+            memgpt_agent.interface = memgpt_agent.interface.nonstreaming_interface
+
+    if hasattr(memgpt_agent.interface, "console"):
+        console = memgpt_agent.interface.console
+    else:
+        console = Console()
+
     counter = 0
     user_input = None
     skip_next_user_input = False
@@ -63,8 +77,8 @@ def run_agent_loop(memgpt_agent, config: MemGPTConfig, first, ms: MetadataStore,
     USER_GOES_FIRST = first
 
     if not USER_GOES_FIRST:
-        console.input("[bold cyan]Hit enter to begin (will request first MemGPT message)[/bold cyan]")
-        clear_line(strip_ui)
+        console.input("[bold cyan]Hit enter to begin (will request first MemGPT message)[/bold cyan]\n")
+        clear_line(console, strip_ui=strip_ui)
         print()
 
     multiline_input = False
@@ -72,12 +86,16 @@ def run_agent_loop(memgpt_agent, config: MemGPTConfig, first, ms: MetadataStore,
     while True:
         if not skip_next_user_input and (counter > 0 or USER_GOES_FIRST):
             # Ask for user input
+            if not stream:
+                print()
             user_input = questionary.text(
                 "Enter your message:",
                 multiline=multiline_input,
                 qmark=">",
             ).ask()
-            clear_line(strip_ui)
+            clear_line(console, strip_ui=strip_ui)
+            if not stream:
+                print()
 
             # Gracefully exit on Ctrl-C/D
             if user_input is None:
@@ -155,13 +173,13 @@ def run_agent_loop(memgpt_agent, config: MemGPTConfig, first, ms: MetadataStore,
                     command = user_input.strip().split()
                     amount = int(command[1]) if len(command) > 1 and command[1].isdigit() else 0
                     if amount == 0:
-                        interface.print_messages(memgpt_agent._messages, dump=True)
+                        memgpt_agent.interface.print_messages(memgpt_agent._messages, dump=True)
                     else:
-                        interface.print_messages(memgpt_agent._messages[-min(amount, len(memgpt_agent.messages)) :], dump=True)
+                        memgpt_agent.interface.print_messages(memgpt_agent._messages[-min(amount, len(memgpt_agent.messages)) :], dump=True)
                     continue
 
                 elif user_input.lower() == "/dumpraw":
-                    interface.print_messages_raw(memgpt_agent._messages)
+                    memgpt_agent.interface.print_messages_raw(memgpt_agent._messages)
                     continue
 
                 elif user_input.lower() == "/memory":
@@ -262,7 +280,7 @@ def run_agent_loop(memgpt_agent, config: MemGPTConfig, first, ms: MetadataStore,
                             fg=typer.colors.GREEN,
                             bold=True,
                         )
-                    except errors.LLMError as e:
+                    except (errors.LLMError, requests.exceptions.HTTPError) as e:
                         typer.secho(
                             f"/summarize failed:\n{e}",
                             fg=typer.colors.RED,
@@ -311,7 +329,7 @@ def run_agent_loop(memgpt_agent, config: MemGPTConfig, first, ms: MetadataStore,
 
                 # No skip options
                 elif user_input.lower() == "/wipe":
-                    memgpt_agent = agent.Agent(interface)
+                    memgpt_agent = agent.Agent(memgpt_agent.interface)
                     user_message = None
 
                 elif user_input.lower() == "/heartbeat":
@@ -344,7 +362,10 @@ def run_agent_loop(memgpt_agent, config: MemGPTConfig, first, ms: MetadataStore,
 
         def process_agent_step(user_message, no_verify):
             new_messages, heartbeat_request, function_failed, token_warning, tokens_accumulated = memgpt_agent.step(
-                user_message, first_message=False, skip_verify=no_verify
+                user_message,
+                first_message=False,
+                skip_verify=no_verify,
+                stream=stream,
             )
 
             skip_next_user_input = False
@@ -366,9 +387,13 @@ def run_agent_loop(memgpt_agent, config: MemGPTConfig, first, ms: MetadataStore,
                     new_messages, user_message, skip_next_user_input = process_agent_step(user_message, no_verify)
                     break
                 else:
-                    with console.status("[bold cyan]Thinking...") as status:
+                    if stream:
+                        # Don't display the "Thinking..." if streaming
                         new_messages, user_message, skip_next_user_input = process_agent_step(user_message, no_verify)
-                        break
+                    else:
+                        with console.status("[bold cyan]Thinking...") as status:
+                            new_messages, user_message, skip_next_user_input = process_agent_step(user_message, no_verify)
+                    break
             except KeyboardInterrupt:
                 print("User interrupt occurred.")
                 retry = questionary.confirm("Retry agent.step()?").ask()
